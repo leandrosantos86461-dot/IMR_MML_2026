@@ -1,3 +1,3 @@
 PARTE 1
 
-/home/alunos/Imagens/Captura de tela de 2026-08-31 20-52-10.png
+![Print](Captura de tela de 2026-09-14 20-09-06.png)
