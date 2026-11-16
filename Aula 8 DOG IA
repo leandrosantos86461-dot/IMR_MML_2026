@@ -1,0 +1,348 @@
+import pygame, math, random, argparse, heapq, statistics
+from collections import deque
+
+W,H,PANEL,FPS=1100,700,300,60
+MW=W-PANEL
+ROAD_Y,ROAD_H=265,170
+CROSS_X,CROSS_W=565,92
+GUIA=42
+SPEED=156
+CELL=10
+COLORS={'bg':(122,132,145),'road':(32,49,78),'tactile':(222,179,23),'white':(238,241,248),'panel':(14,23,42),'green':(46,210,127),'red':(236,75,82),'yellow':(255,199,53)}
+LOCAIS=[('CASA',pygame.Rect(46,73,95,62),(40,90,140)),('FARMÁCIA',pygame.Rect(650,68,120,70),(142,55,91)),('MERCADO',pygame.Rect(35,570,105,70),(31,139,113)),('PADARIA',pygame.Rect(655,565,115,72),(160,105,82))]
+DEST={'1':('Mercado',(185,625)),'2':('Farmácia',(625,145)),'3':('Padaria',(625,540)),'4':('Casa',(165,145))}
+OBST=[(pygame.Rect(255,126,55,55),'solo'),(pygame.Rect(395,175,42,40),'solo'),(pygame.Rect(325,515,50,45),'solo'),(pygame.Rect(450,535,65,35),'suspenso'),(pygame.Rect(230,510,55,40),'suspenso')]
+
+def obstacles():
+    return OBST+[(rect,'local') for _,rect,_ in LOCAIS]
+
+class Signal:
+    phases=[('VERDE',8),('AMARELO',2),('TODOS_VERM_1',1.5),('PEDESTRE',12),('TODOS_VERM_2',1.5)]
+    def __init__(self): self.i=0;self.t=0
+    @property
+    def phase(self):return self.phases[self.i][0]
+    @property
+    def remaining(self):return self.phases[self.i][1]-self.t
+    def step(self,dt):
+        self.t+=dt
+        while self.t>=self.phases[self.i][1]:
+            self.t-=self.phases[self.i][1];self.i=(self.i+1)%len(self.phases)
+
+class Car:
+    def __init__(self,rng,lane,x=None):
+        self.lane=lane;self.direction=1 if lane==0 else -1
+        self.x=float(x if x is not None else (-90 if lane==0 else MW+90))
+        self.y=ROAD_Y+(43 if lane==0 else 124)
+        self.v=rng.uniform(85,110);self.target=rng.uniform(110,165)
+        self.infractor=rng.random()<.13
+        self.color=rng.choice([(238,172,57),(62,170,201),(171,102,218),(217,94,95)])
+    def rect(self):return pygame.Rect(int(self.x-27),int(self.y-15),54,30)
+    def step(self,dt,signal,others):
+        stop=(CROSS_X-40 if self.direction==1 else CROSS_X+CROSS_W+40)
+        distance=(stop-self.x)*self.direction
+        obey=not self.infractor and signal.phase not in ('VERDE','AMARELO')
+        want=self.target
+        if obey and 0<distance<max(55,self.v*self.v/(2*260)+18):want=0
+        for other in others:
+            if other is self or other.lane!=self.lane:continue
+            gap=(other.x-self.x)*self.direction
+            if 0<gap<100:want=min(want,max(0,(gap-62)*2))
+        a=150 if want>self.v else 260
+        self.v=max(0,min(self.target,self.v+(a if want>self.v else -a)*dt))
+        if obey and 0<distance<12 and self.v<45:self.v=0
+        self.x+=self.direction*self.v*dt
+
+class World:
+    def __init__(self,seed=1):
+        self.rng=random.Random(seed);self.signal=Signal();self.cars=[Car(self.rng,0,-80),Car(self.rng,1,MW+80)]
+        self.spawn=[0,0];self.time=0
+    def step(self,dt):
+        self.time+=dt;self.signal.step(dt)
+        for c in self.cars:c.step(dt,self.signal,self.cars)
+        self.cars=[c for c in self.cars if -170<c.x<MW+170]
+        for lane in range(2):
+            self.spawn[lane]+=dt
+            if self.spawn[lane]>self.rng.uniform(2.2,4.2):
+                self.spawn[lane]=0
+                entry=-85 if lane==0 else MW+85
+                if all(abs(c.x-entry)>105 for c in self.cars if c.lane==lane):self.cars.append(Car(self.rng,lane))
+
+def grid_path(start,end):
+    cols,rows=MW//CELL,H//CELL
+    blocked=set();cost={}
+    for gy in range(rows):
+        for gx in range(cols):
+            x,y=gx*CELL+5,gy*CELL+5
+            if x<20 or x>MW-20 or y<20 or y>H-20:blocked.add((gx,gy));continue
+            if ROAD_Y-50<y<ROAD_Y+ROAD_H+50 and not CROSS_X+30<x<CROSS_X+CROSS_W-30:blocked.add((gx,gy));continue
+            for rect,typ in obstacles():
+                margin=48 if typ=='suspenso' else 42
+                if rect.inflate(margin*2,margin*2).collidepoint(x,y):blocked.add((gx,gy));break
+            tactile=(abs(y-135)<12 and 50<x<610) or (abs(x-610)<12 and 125<y<ROAD_Y) or (abs(x-610)<12 and ROAD_Y+ROAD_H<y<570) or (abs(y-560)<12 and 140<x<625)
+            cost[gx,gy]=.45 if tactile else 1.0
+    def snap(p):
+        c=(max(0,min(cols-1,int(p[0]/CELL))),max(0,min(rows-1,int(p[1]/CELL))))
+        if c not in blocked:return c
+        for r in range(1,20):
+            opts=[(c[0]+dx,c[1]+dy) for dx in range(-r,r+1) for dy in range(-r,r+1) if 0<=c[0]+dx<cols and 0<=c[1]+dy<rows and (c[0]+dx,c[1]+dy) not in blocked]
+            if opts:return min(opts,key=lambda q:(q[0]-c[0])**2+(q[1]-c[1])**2)
+        return c
+    s,t=snap(start),snap(end)
+    heap=[(0,s)];g={s:0};prev={};closed=set()
+    while heap:
+        _,u=heapq.heappop(heap)
+        if u in closed:continue
+        if u==t:break
+        closed.add(u)
+        for dx in (-1,0,1):
+            for dy in (-1,0,1):
+                if not(dx or dy):continue
+                v=(u[0]+dx,u[1]+dy)
+                if v in blocked or not(0<=v[0]<cols and 0<=v[1]<rows):continue
+                if dx and dy and ((u[0]+dx,u[1]) in blocked or (u[0],u[1]+dy) in blocked):continue
+                ng=g[u]+math.hypot(dx,dy)*cost.get(v,1)
+                if ng<g.get(v,1e20):
+                    g[v]=ng;prev[v]=u
+                    ax,ay=abs(t[0]-v[0]),abs(t[1]-v[1]);h=max(ax,ay)+(math.sqrt(2)-1)*min(ax,ay)
+                    heapq.heappush(heap,(ng+.45*h,v))
+    if t!=s and t not in prev:return []
+    route=[t]
+    while route[-1]!=s:route.append(prev[route[-1]])
+    route.reverse()
+    return [(x*CELL+5,y*CELL+5) for x,y in route]
+
+class Robot:
+    def __init__(self,world):
+        self.x,self.y=165.,145.;self.tx,self.ty=190.,145.;self.angle=0
+        self.target=None;self.route=[];self.idx=0;self.state='PARADO';self.message='Selecione um destino (1 a 4).'
+        self.dist=0;self.alerts=0;self.brakes=0;self.near=0;self.collisions=0;self.completed=0
+        self.start_time=0;self.travel_times=[];self.stuck=0;self.last=(self.x,self.y);self.scan=deque(maxlen=3);self.lidar=[];self.last_alert=False;self.last_brake=False;self.cross_started=False
+    def choose(self,key,world):
+        self.target=DEST[key];self.route=grid_path((self.x,self.y),self.target[1]);self.idx=0
+        self.state='NAVEGANDO';self.message='Rota planejada para '+self.target[0];self.start_time=world.time;self.cross_started=False
+    def sense(self,world):
+        readings=[]
+        for i in range(19):
+            a=self.angle+math.radians(-75+150*i/18);reach=165.;kind=None
+            end=(self.x+math.cos(a)*reach,self.y+math.sin(a)*reach)
+            for rect,typ in obstacles()+[(c.rect(),'veiculo') for c in world.cars]:
+                clipped=rect.clipline((int(self.x),int(self.y)),(int(end[0]),int(end[1])))
+                if clipped:
+                    for p in clipped:
+                        d=math.hypot(p[0]-self.x,p[1]-self.y)
+                        if d<reach:reach=d;kind=typ
+            for edge in [pygame.Rect(0,0,15,H),pygame.Rect(MW-15,0,15,H),pygame.Rect(0,0,MW,15),pygame.Rect(0,H-15,MW,15)]:
+                clipped=edge.clipline((int(self.x),int(self.y)),(int(end[0]),int(end[1])))
+                if clipped:
+                    for p in clipped:reach=min(reach,math.hypot(p[0]-self.x,p[1]-self.y))
+            if world.rng.random()<.02:reach=165.;kind=None
+            else:reach=max(0,min(165,reach+world.rng.gauss(0,1.5)))
+            readings.append((reach,kind,a))
+        self.scan.append(readings)
+        self.lidar=[(statistics.median(frame[i][0] for frame in self.scan),readings[i][1],readings[i][2]) for i in range(19)]
+    def danger(self,world):
+        robot=pygame.Rect(int(self.x-20),int(self.y-20),40,40)
+        tutor=pygame.Rect(int(self.tx-12),int(self.ty-12),24,24)
+        for car in world.cars:
+            future=car.rect().move(int(car.direction*car.v),0)
+            swept=car.rect().union(future).inflate(24,24)
+            if swept.colliderect(robot) or swept.colliderect(tutor):return True
+        return False
+    def apply_barrier(self,nx,ny,world):
+        if (self.y<ROAD_Y and ny>=ROAD_Y-17) or (self.y>ROAD_Y+ROAD_H and ny<=ROAD_Y+ROAD_H+17):
+            if not(CROSS_X+22<nx<CROSS_X+CROSS_W-22):return self.x,self.y,False
+            needed=(ROAD_H+24+GUIA)/SPEED*1.35+.4
+            if world.signal.phase!='PEDESTRE' or world.signal.remaining<=needed:return self.x,self.y,False
+        if ROAD_Y-20<ny<ROAD_Y+ROAD_H+20 and not(CROSS_X+22<nx<CROSS_X+CROSS_W-22):return self.x,self.y,False
+        return nx,ny,True
+    def step(self,dt,world):
+        self.sense(world)
+        if not self.target:return
+        goal=self.target[1]
+        if math.hypot(self.x-goal[0],self.y-goal[1])<27:
+            if self.state!='CHEGOU':self.completed+=1;self.travel_times.append(world.time-self.start_time)
+            self.state='CHEGOU';self.message='CHEGAMOS! Ponto livre, com segurança!';return
+        risky=self.danger(world)
+        if risky:
+            self.state='FREIO_EMERGENCIA';self.message='FREIO DE EMERGÊNCIA: veículo próximo!'
+            if not self.last_brake:self.brakes+=1
+            self.last_brake=True;return
+        self.last_brake=False
+        on_road=ROAD_Y-5<self.y<ROAD_Y+ROAD_H+5
+        approaching=not on_road and ((self.y<ROAD_Y and goal[1]>ROAD_Y) or (self.y>ROAD_Y+ROAD_H and goal[1]<ROAD_Y+ROAD_H)) and abs(self.x-(CROSS_X+CROSS_W/2))<62
+        permitted=world.signal.phase=='PEDESTRE' and world.signal.remaining>(ROAD_H+24+GUIA)/SPEED*1.35+.4
+        if approaching and not permitted:
+            self.state='AGUARDANDO_SINAL';self.message='Aguardando sinal seguro para pedestres.';return
+        self.state='ATRAVESSANDO' if on_road else 'NAVEGANDO'
+        self.message='Travessia em andamento.' if on_road else 'Caminho livre. Seguindo pelo piso tátil.'
+        if not self.route:self.route=grid_path((self.x,self.y),goal);self.idx=0
+        while self.idx<len(self.route)-1 and math.hypot(self.x-self.route[self.idx][0],self.y-self.route[self.idx][1])<14:self.idx+=1
+        waypoint=self.route[min(self.idx,len(self.route)-1)] if self.route else goal
+        dx,dy=waypoint[0]-self.x,waypoint[1]-self.y
+        angle=math.atan2(dy,dx)
+        forward=[d for d,typ,a in self.lidar if abs((a-angle+math.pi)%(2*math.pi)-math.pi)<.40]
+        minfront=min(forward,default=165)
+        if minfront<45:
+            if not self.last_alert:self.alerts+=1
+            self.last_alert=True
+            angle+=.85 if self.lidar[0][0]>self.lidar[-1][0] else -.85
+            self.message='Obstáculo detectado. Desviando.'
+        else:self.last_alert=False
+        slack=max(0,math.hypot(self.x-self.tx,self.y-self.ty)-GUIA-10)
+        speed=SPEED*max(.20,1-slack/75)
+        if minfront<65:speed*=.35
+        nx=self.x+math.cos(angle)*speed*dt;ny=self.y+math.sin(angle)*speed*dt
+        nx,ny,allowed=self.apply_barrier(nx,ny,world)
+        if not allowed:
+            self.state='AGUARDANDO_SINAL';self.message='Meio-fio bloqueado: aguardando faixa e sinal.'
+        else:
+            collision=any(rect.inflate(48 if typ=='suspenso' else 42,48 if typ=='suspenso' else 42).collidepoint(nx,ny) for rect,typ in obstacles())
+            if not collision:
+                self.dist+=math.hypot(nx-self.x,ny-self.y);self.x,self.y=nx,ny;self.angle=angle
+        td=math.hypot(self.x-self.tx,self.y-self.ty)
+        if td>GUIA:
+            step=min(125*dt,td-GUIA)
+            self.tx+=(self.x-self.tx)/td*step;self.ty+=(self.y-self.ty)/td*step
+        if math.hypot(self.x-self.last[0],self.y-self.last[1])<2:self.stuck+=dt
+        else:self.stuck=0;self.last=(self.x,self.y)
+        if self.stuck>3.5:self.route=grid_path((self.x,self.y),goal);self.idx=0;self.stuck=0
+        for car in world.cars:
+            if car.rect().inflate(28,28).collidepoint(self.x,self.y):self.collisions+=1
+            elif car.rect().inflate(60,60).collidepoint(self.x,self.y):self.near+=1
+
+def draw_text(surf,font,text,x,y,color=(240,244,252)):
+    surf.blit(font.render(str(text),True,color),(x,y))
+
+def draw_robot(screen,x,y,angle):
+    px,int_y=int(x),int(y)
+    shadow=pygame.Surface((54,28),pygame.SRCALPHA)
+    pygame.draw.ellipse(shadow,(15,22,34,80),(0,0,54,28))
+    screen.blit(shadow,(px-27,int_y+18))
+    pygame.draw.line(screen,(176,214,255),(px,py:=int_y-20),(px,int_y-42),3)
+    pygame.draw.circle(screen,(255,204,92),(px,int_y-48),6)
+    body=pygame.Rect(px-18,int_y-12,36,24)
+    pygame.draw.rect(screen,(60,128,255),body,border_radius=12)
+    inner=body.inflate(-10,-8)
+    pygame.draw.rect(screen,(170,214,255),inner,border_radius=9)
+    head=pygame.Rect(px-16,int_y-28,32,18)
+    pygame.draw.rect(screen,(16,28,46),head,border_radius=9)
+    visor=pygame.Rect(px-13,int_y-25,26,10)
+    pygame.draw.rect(screen,(85,214,255),visor,border_radius=5)
+    for ox in (-7,7):
+        eye=(px+ox,int_y-21)
+        pygame.draw.circle(screen,(255,255,255),eye,3)
+        pygame.draw.circle(screen,(80,255,214),eye,2)
+    front_x=px+math.cos(angle)*19
+    front_y=int_y+math.sin(angle)*19
+    pygame.draw.line(screen,(220,236,255),(px,int_y),(front_x,front_y),4)
+    pygame.draw.circle(screen,(255,196,67),(int(front_x),int(front_y)),7)
+    pygame.draw.rect(screen,(14,22,40),pygame.Rect(px-7,int_y+12,14,10),border_radius=5)
+    pygame.draw.rect(screen,(14,22,40),pygame.Rect(px-21,int_y+12,10,14),border_radius=5)
+    pygame.draw.rect(screen,(14,22,40),pygame.Rect(px+11,int_y+12,10,14),border_radius=5)
+    pygame.draw.circle(screen,(255,255,255),(px-8,int_y+9),3)
+    pygame.draw.circle(screen,(255,255,255),(px+8,int_y+9),3)
+
+def draw(screen,world,robot,fonts,show_lidar=True):
+    f,small,big=fonts;screen.fill(COLORS['bg'])
+    pygame.draw.rect(screen,(51,131,92),(0,0,MW,26));pygame.draw.rect(screen,(51,131,92),(0,H-26,MW,26))
+    pygame.draw.rect(screen,COLORS['road'],(0,ROAD_Y,MW,ROAD_H))
+    pygame.draw.line(screen,(210,218,227),(0,ROAD_Y),(MW,ROAD_Y),4)
+    pygame.draw.line(screen,(210,218,227),(0,ROAD_Y+ROAD_H),(MW,ROAD_Y+ROAD_H),4)
+    for x in range(15,MW,58):
+        if not CROSS_X-30<x<CROSS_X+CROSS_W+30:pygame.draw.line(screen,(221,230,242),(x,ROAD_Y+ROAD_H//2),(x+29,ROAD_Y+ROAD_H//2),3)
+    for y in range(ROAD_Y+9,ROAD_Y+ROAD_H-10,23):pygame.draw.rect(screen,(238,243,250),(CROSS_X,y,CROSS_W,14))
+    gold=COLORS['tactile']
+    for rect in [(60,135,550,12),(604,135,12,ROAD_Y-135),(604,ROAD_Y+ROAD_H,12,125),(155,555,461,12)]:pygame.draw.rect(screen,gold,rect)
+    for name,rect,color in LOCAIS:
+        pygame.draw.rect(screen,(226,231,239),rect.inflate(8,8),border_radius=6)
+        pygame.draw.rect(screen,color,rect,border_radius=6)
+        draw_text(screen,small,name,rect.x+8,rect.y+rect.height//2-8)
+    for rect,typ in OBST:
+        pygame.draw.rect(screen,(108,69,129) if typ=='suspenso' else (56,76,99),rect,border_radius=5)
+        draw_text(screen,small,'ALTO' if typ=='suspenso' else 'OBST.',rect.x+3,rect.y+10)
+    pedestrian=world.signal.phase=='PEDESTRE'
+    for sy in (ROAD_Y-40,ROAD_Y+ROAD_H+9):
+        pygame.draw.rect(screen,(20,34,51),(CROSS_X-35,sy,24,37),border_radius=5)
+        pygame.draw.circle(screen,COLORS['green'] if pedestrian else (54,76,66),(CROSS_X-23,sy+10),5)
+        pygame.draw.circle(screen,COLORS['red'] if not pedestrian else (80,45,50),(CROSS_X-23,sy+26),5)
+    for c in world.cars:
+        r=c.rect();pygame.draw.rect(screen,c.color,r,border_radius=8)
+        pygame.draw.rect(screen,(31,49,72),(r.x+13,r.y+5,25,20),border_radius=4)
+        pygame.draw.rect(screen,(230,236,243),r,2,border_radius=8)
+    if robot.route and robot.target and robot.state!='CHEGOU':
+        pts=robot.route[::3]
+        if len(pts)>1:pygame.draw.lines(screen,(102,216,166),False,pts,2)
+    if show_lidar:
+        for d,_,a in robot.lidar:
+            pygame.draw.line(screen,(65,168,128) if d>110 else (222,92,90),(robot.x,robot.y),(robot.x+math.cos(a)*d,robot.y+math.sin(a)*d),1)
+    pygame.draw.line(screen,(251,209,46),(robot.x,robot.y),(robot.tx,robot.ty),4)
+    pygame.draw.circle(screen,(241,241,245),(int(robot.tx),int(robot.ty)),12)
+    pygame.draw.circle(screen,(20,30,45),(int(robot.tx),int(robot.ty)),12,2)
+    draw_robot(screen,robot.x,robot.y,robot.angle)
+    pygame.draw.rect(screen,COLORS['panel'],(MW,0,PANEL,H))
+    pygame.draw.line(screen,(109,146,185),(MW,0),(MW,H),2)
+    x=MW+17;y=19
+    draw_text(screen,big,'TELEMETRIA DOG-IA V2',x,y,(61,153,244));y+=42
+    for line in ['Modo: AUTÔNOMO (IA)','Estado: '+robot.state,'Destino: '+(robot.target[0] if robot.target else 'NENHUM'),'Pedestre: '+('PASSE (VERDE)' if pedestrian else 'PARE (VERMELHO)'),'Semáforo: '+world.signal.phase,'Tempo sinal: %.1f s'%world.signal.remaining]:
+        draw_text(screen,small,line,x,y,(233,239,248));y+=24
+    y+=8
+    pygame.draw.rect(screen,(21,132,92) if robot.state=='CHEGOU' else (132,55,62) if robot.state=='FREIO_EMERGENCIA' else (38,83,116),(x,y,PANEL-34,77),border_radius=8)
+    words=robot.message.split();lines=[];line=''
+    for word in words:
+        if len(line+' '+word)>33:lines.append(line);line=word
+        else:line=(line+' '+word).strip()
+    lines.append(line)
+    for i,line in enumerate(lines[:3]):draw_text(screen,small,line,x+10,y+11+i*19)
+    y+=98
+    draw_text(screen,f,'MÉTRICAS DA VIAGEM',x,y);y+=31
+    for line in ['Tempo: %.1f s'%world.time,'Distância: %.1f m'%(robot.dist/100),'Alertas: %d  Freios: %d'%(robot.alerts,robot.brakes),'Quase-colisões: %d'%robot.near,'Colisões: %d'%robot.collisions,'Viagens concluídas: %d'%robot.completed]:draw_text(screen,small,line,x,y);y+=23
+    y+=13;draw_text(screen,f,'CONTROLES',x,y);y+=28
+    for line in ['1 Mercado  2 Farmácia','3 Padaria  4 Casa','Clique esq.: novo destino','Clique dir.: criar obstáculo','P: pausar  R: reiniciar','L: ligar/desligar LiDAR','ESC: sair']:
+        draw_text(screen,small,line,x,y);y+=21
+    pygame.display.flip()
+
+def run_benchmark(n,seed):
+    rng=random.Random(seed);results=[]
+    for trial in range(n):
+        world=World(rng.randint(0,2**31-1));robot=Robot(world);robot.choose('1',world)
+        dt=1/30
+        for _ in range(30*100):
+            world.step(dt);robot.step(dt,world)
+            if robot.state=='CHEGOU':break
+        results.append((robot.completed>0,robot.travel_times[-1] if robot.travel_times else None,robot.collisions,robot.near))
+    wins=sum(r[0] for r in results)
+    times=[r[1] for r in results if r[1] is not None]
+    print('DOG-IA V2 | benchmark',n,'| seed',seed)
+    print('Taxa de sucesso: %.1f%%'%(100*wins/n))
+    print('Tempo médio (viagens concluídas):',round(statistics.mean(times),2) if times else 'N/D','s')
+    print('Colisões:',sum(r[2] for r in results))
+    print('Quase-colisões (contagem por quadro):',sum(r[3] for r in results))
+    print('Viagens concluídas:',wins,'/',n)
+
+def main():
+    parser=argparse.ArgumentParser();parser.add_argument('--benchmark',type=int,default=0);parser.add_argument('--seed',type=int,default=1)
+    args=parser.parse_args()
+    if args.benchmark:
+        run_benchmark(args.benchmark,args.seed);return
+    pygame.init();screen=pygame.display.set_mode((W,H));pygame.display.set_caption('DOG-IA V2 — Cão-guia robô (F11: tela cheia)')
+    fonts=(pygame.font.SysFont('arial',19,bold=True),pygame.font.SysFont('arial',16),pygame.font.SysFont('arial',21,bold=True))
+    world=World(args.seed);robot=Robot(world);clock=pygame.time.Clock();paused=False;lidar=True;running=True
+    while running:
+        dt=min(clock.tick(FPS)/1000,.05)
+        for event in pygame.event.get():
+            if event.type==pygame.QUIT:running=False
+            if event.type==pygame.KEYDOWN:
+                if event.key==pygame.K_ESCAPE:running=False
+                elif event.unicode in DEST:robot.choose(event.unicode,world)
+                elif event.key==pygame.K_p:paused=not paused
+                elif event.key==pygame.K_l:lidar=not lidar
+                elif event.key==pygame.K_r:world=World(args.seed);robot=Robot(world)
+                elif event.key==pygame.K_F11:pygame.display.toggle_fullscreen()
+            if event.type==pygame.MOUSEBUTTONDOWN and event.pos[0]<MW:
+                if event.button==1:
+                    pos=event.pos;robot.target=('Ponto livre',pos);robot.route=grid_path((robot.x,robot.y),pos);robot.idx=0;robot.state='NAVEGANDO';robot.start_time=world.time
+                elif event.button==3:OBST.append((pygame.Rect(event.pos[0]-18,event.pos[1]-18,36,36),'solo'))
+        if not paused:world.step(dt);robot.step(dt,world)
+        draw(screen,world,robot,fonts,lidar)
+    pygame.quit()
+if __name__=='__main__':main()
